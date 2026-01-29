@@ -10,6 +10,16 @@ Voice dictation for Linux using Deepgram's live transcription API. Types directl
 - Desktop notifications for status
 - Multi-language support
 
+## Quick Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/JoeNerdan/dictate-deepgram/main/install.sh | bash
+```
+
+This installs dependencies, prompts for your API key, and sets everything up.
+
+Get an API key at https://console.deepgram.com/
+
 ## Requirements
 
 - Linux with X11
@@ -18,7 +28,10 @@ Voice dictation for Linux using Deepgram's live transcription API. Types directl
 - notify-send (optional, for notifications)
 - PortAudio library
 
-## Installation
+## Manual Installation
+
+<details>
+<summary>Click to expand</summary>
 
 Install system dependencies (Fedora):
 ```bash
@@ -37,25 +50,17 @@ pip install deepgram-sdk pyaudio
 
 Install the script:
 ```bash
-cp dictate-deepgram ~/.local/bin/
+curl -fsSL https://raw.githubusercontent.com/JoeNerdan/dictate-deepgram/main/dictate-deepgram \
+    -o ~/.local/bin/dictate-deepgram
 chmod +x ~/.local/bin/dictate-deepgram
 ```
 
-## Configuration
+Configure your API key:
+```bash
+echo "your-api-key" > ~/.config/deepgram-api-key
+```
 
-Set your Deepgram API key using one of these methods:
-
-1. Environment variable:
-   ```bash
-   export DEEPGRAM_API_KEY="your-api-key"
-   ```
-
-2. Config file:
-   ```bash
-   echo "your-api-key" > ~/.config/deepgram-api-key
-   ```
-
-Get an API key at https://console.deepgram.com/
+</details>
 
 ## Usage
 
