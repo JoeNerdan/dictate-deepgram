@@ -1,0 +1,427 @@
+#!/usr/bin/env python3
+"""
+Voice dictation using Deepgram live transcription API.
+
+Usage: dictate-deepgram [--lang=LANG]
+  --lang=LANG          Language code. Examples:
+                         en-US        English (default)
+                         de           German
+                         es           Spanish
+                         auto         Auto-detect language
+
+Toggle behavior: Run once to start, run again to stop.
+Press Ctrl+C to stop manually.
+
+Requires:
+  - pip install deepgram-sdk pyaudio
+  - DEEPGRAM_API_KEY environment variable set
+"""
+
+import argparse
+import os
+import signal
+import subprocess
+import sys
+import threading
+import queue
+import time
+from pathlib import Path
+
+# PID file for toggle behavior
+PIDFILE = Path("/tmp/dictate-deepgram.pid")
+
+
+def notify(message: str):
+    """Show desktop notification."""
+    try:
+        subprocess.run(
+            ["notify-send", "-t", "500", "-e", "-h", "string:x-canonical-private-synchronous:dictation",
+             "-i", "audio-input-microphone", "Dictation", message],
+            check=False,
+            capture_output=True
+        )
+    except FileNotFoundError:
+        pass
+
+
+def xdotool_type(text: str):
+    """Type text using xdotool. Fast, atomic operation."""
+    if text:
+        subprocess.run(
+            ["xdotool", "type", "--clearmodifiers", "--delay", "0", "--", text],
+            check=False
+        )
+
+
+def xdotool_backspace(count: int):
+    """Send backspace keys using xdotool. Single atomic operation."""
+    if count > 0:
+        subprocess.run(
+            ["xdotool", "key", "--clearmodifiers", "--delay", "0"] + ["BackSpace"] * count,
+            check=False
+        )
+
+
+def check_stop_requested() -> bool:
+    """Check if another instance requested us to stop."""
+    return not PIDFILE.exists()
+
+
+def request_stop():
+    """Request running instance to stop by removing PID file."""
+    if PIDFILE.exists():
+        pid = int(PIDFILE.read_text().strip())
+        PIDFILE.unlink(missing_ok=True)
+        # Give it a moment to notice
+        time.sleep(0.3)
+        # If still running, send SIGTERM
+        try:
+            os.kill(pid, 0)  # Check if alive
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        return True
+    return False
+
+
+def acquire_lock() -> bool:
+    """Try to acquire the lock. Returns False if another instance is running."""
+    if PIDFILE.exists():
+        # Another instance running - request it to stop
+        request_stop()
+        return False
+
+    PIDFILE.write_text(str(os.getpid()))
+    return True
+
+
+def release_lock():
+    """Release the lock."""
+    PIDFILE.unlink(missing_ok=True)
+
+
+class DisplayState:
+    """
+    Track what's currently typed on screen.
+
+    Key insight: We track two lengths:
+    - final_len: Characters that are finalized (never backspace past this)
+    - typed_len: Total characters currently on screen
+
+    The interim portion (typed_len - final_len) can be backspaced and retyped.
+    """
+
+    def __init__(self):
+        self.final_len = 0      # Characters that are permanent
+        self.typed_len = 0      # Total characters on screen
+        self.lock = threading.Lock()
+
+    def update(self, new_text: str, is_final: bool):
+        """
+        Update the display to show new_text.
+
+        For interim results: may backspace and retype the interim portion.
+        For final results: mark as permanent and add trailing space.
+        """
+        with self.lock:
+            new_len = len(new_text)
+
+            if new_len > self.typed_len:
+                # Text grew - just type the new characters
+                to_type = new_text[self.typed_len:]
+                xdotool_type(to_type)
+                self.typed_len = new_len
+
+            elif new_len < self.typed_len:
+                # Text got shorter (correction) - backspace and retype
+                # Only backspace the interim portion, never past final_len
+                interim_typed = self.typed_len - self.final_len
+                chars_to_remove = self.typed_len - new_len
+                backspace_count = min(chars_to_remove, interim_typed)
+
+                if backspace_count > 0:
+                    xdotool_backspace(backspace_count)
+
+                # After backspace, we're at position (typed_len - backspace_count)
+                cursor_pos = self.typed_len - backspace_count
+
+                # Type any new characters from cursor position to new_len
+                if new_len > cursor_pos:
+                    xdotool_type(new_text[cursor_pos:])
+
+                self.typed_len = new_len
+
+            if is_final:
+                self.final_len = new_len
+                # Add space after final phrase
+                xdotool_type(" ")
+                self.typed_len += 1
+                self.final_len += 1
+
+
+class MicrophoneStream:
+    """Opens a recording stream as a generator yielding audio chunks."""
+
+    def __init__(self, rate: int = 16000, chunk_size: int = 1600):
+        self._rate = rate
+        self._chunk_size = chunk_size
+        self._buff = queue.Queue()
+        self._closed = True
+        self._audio_interface = None
+        self._audio_stream = None
+
+    def __enter__(self):
+        import pyaudio
+
+        self._audio_interface = pyaudio.PyAudio()
+        self._audio_stream = self._audio_interface.open(
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=self._rate,
+            input=True,
+            frames_per_buffer=self._chunk_size,
+            stream_callback=self._fill_buffer,
+        )
+        self._closed = False
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def close(self):
+        if not self._closed:
+            self._closed = True
+            self._buff.put(None)
+            if self._audio_stream:
+                self._audio_stream.stop_stream()
+                self._audio_stream.close()
+            if self._audio_interface:
+                self._audio_interface.terminate()
+
+    def _fill_buffer(self, in_data, frame_count, time_info, status_flags):
+        import pyaudio
+        self._buff.put(in_data)
+        return None, pyaudio.paContinue
+
+    def generator(self):
+        while not self._closed:
+            chunk = self._buff.get()
+            if chunk is None:
+                return
+            data = [chunk]
+
+            # Grab any additional available chunks
+            while True:
+                try:
+                    chunk = self._buff.get(block=False)
+                    if chunk is None:
+                        return
+                    data.append(chunk)
+                except queue.Empty:
+                    break
+
+            yield b"".join(data)
+
+
+def get_deepgram_api_key() -> str:
+    """Get Deepgram API key from env var or config file."""
+    api_key = os.environ.get("DEEPGRAM_API_KEY")
+    if api_key:
+        return api_key
+
+    # Try config file
+    config_path = Path.home() / ".config/deepgram-api-key"
+    if config_path.exists():
+        return config_path.read_text().strip()
+
+    return None
+
+
+def run_streaming_recognition(lang: str):
+    """Run streaming speech recognition with real-time display."""
+    from deepgram import DeepgramClient
+    from deepgram.listen import ListenV1Results
+
+    api_key = get_deepgram_api_key()
+    if not api_key:
+        notify("Error: No API key found")
+        print("Set DEEPGRAM_API_KEY or place key at ~/.config/deepgram-api-key")
+        sys.exit(1)
+
+    client = DeepgramClient(api_key=api_key)
+
+    # Handle language specification
+    # For streaming, "multi" enables multilingual code-switching
+    if lang == "auto":
+        language = "multi"
+    else:
+        language = lang
+
+    # State tracking
+    display = DisplayState()
+    stop_event = threading.Event()
+    mic_stream = None
+    last_activity = time.time()
+    activity_lock = threading.Lock()
+    SILENCE_TIMEOUT = 7
+
+    # Track the current accumulated text
+    final_text = ""
+    final_text_lock = threading.Lock()
+
+    def update_activity():
+        nonlocal last_activity
+        with activity_lock:
+            last_activity = time.time()
+
+    def check_stop():
+        nonlocal mic_stream
+        while not stop_event.is_set():
+            if check_stop_requested():
+                stop_event.set()
+                if mic_stream:
+                    mic_stream.close()
+                return
+
+            with activity_lock:
+                silence_duration = time.time() - last_activity
+
+            if silence_duration >= SILENCE_TIMEOUT:
+                notify("Stopped (silence)")
+                stop_event.set()
+                if mic_stream:
+                    mic_stream.close()
+                return
+
+            time.sleep(0.1)
+
+    stop_thread = threading.Thread(target=check_stop, daemon=True)
+    stop_thread.start()
+
+    # Build connection parameters
+    connect_kwargs = {
+        "model": "nova-3",
+        "language": language,
+        "punctuate": "true",
+        "interim_results": "true",
+        "encoding": "linear16",
+        "sample_rate": "16000",
+        "channels": "1",
+        "smart_format": "true",
+        "endpointing": "500",  # Higher value for cleaner utterance boundaries
+    }
+
+    try:
+        with MicrophoneStream() as stream:
+            mic_stream = stream
+
+            with client.listen.v1.connect(**connect_kwargs) as ws:
+                # Thread to send audio
+                def send_audio():
+                    for chunk in stream.generator():
+                        if stop_event.is_set():
+                            break
+                        try:
+                            ws.send_media(chunk)
+                        except Exception:
+                            break
+
+                audio_thread = threading.Thread(target=send_audio, daemon=True)
+                audio_thread.start()
+
+                # Receive transcripts in main thread
+                for result in ws:
+                    if stop_event.is_set():
+                        break
+
+                    if not isinstance(result, ListenV1Results):
+                        continue
+
+                    try:
+                        transcript = result.channel.alternatives[0].transcript
+                    except (AttributeError, IndexError):
+                        continue
+
+                    if not transcript:
+                        continue
+
+                    update_activity()
+                    is_final = result.is_final
+
+                    with final_text_lock:
+                        if is_final:
+                            full_text = final_text + transcript
+                            display.update(full_text, is_final=True)
+                            final_text = full_text + " "
+                        else:
+                            full_text = final_text + transcript
+                            display.update(full_text, is_final=False)
+
+    except Exception as e:
+        err_str = str(e)
+        if stop_event.is_set():
+            pass
+        elif "cancelled" in err_str.lower():
+            pass
+        else:
+            notify(f"Error: {e}")
+            raise
+    finally:
+        stop_event.set()
+        if mic_stream:
+            mic_stream.close()
+
+    with final_text_lock:
+        return final_text.strip()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Deepgram STT dictation")
+    parser.add_argument("--lang", default="en-US", help="Language code (en-US, de, es, auto)")
+    args = parser.parse_args()
+
+    # Check credentials early
+    if not get_deepgram_api_key():
+        notify("Error: No API key found")
+        print("Set DEEPGRAM_API_KEY or place key at ~/.config/deepgram-api-key")
+        sys.exit(1)
+
+    # Toggle behavior
+    if not acquire_lock():
+        notify("Stopping dictation...")
+        sys.exit(0)
+
+    # Handle signals for clean shutdown
+    def signal_handler(signum, frame):
+        release_lock()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+
+    try:
+        if args.lang == "auto":
+            lang_display = "Auto"
+        else:
+            lang_display = args.lang.split("-")[0].upper()
+        notify(f"Listening ({lang_display})...")
+
+        result = run_streaming_recognition(args.lang)
+
+        if result:
+            preview = result[:50] + "..." if len(result) > 50 else result
+            notify(f"Done: {preview}")
+        else:
+            notify("No speech detected")
+
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        notify(f"Error: {e}")
+        raise
+    finally:
+        release_lock()
+
+
+if __name__ == "__main__":
+    main()
