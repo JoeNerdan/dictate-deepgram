@@ -74,8 +74,96 @@ if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
     echo "Note: Add ~/.local/bin to your PATH:"
     echo "  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.bashrc"
 fi
+echo
+
+# Keyboard shortcut setup
+setup_gnome_shortcut() {
+    local shortcut="$1"
+    local name="Dictate"
+    local command="$HOME/.local/bin/dictate-deepgram"
+    local path="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/dictate/"
+
+    # Get current custom keybindings
+    local current=$(gsettings get org.gnome.settings-daemon.plugins.media-keys custom-keybindings)
+
+    # Check if our binding already exists
+    if [[ "$current" == *"dictate"* ]]; then
+        echo "Keyboard shortcut already configured"
+    else
+        # Add our path to the list
+        if [[ "$current" == "@as []" ]]; then
+            new_bindings="['$path']"
+        else
+            # Remove trailing ] and add our path
+            new_bindings="${current%]*}, '$path']"
+        fi
+        gsettings set org.gnome.settings-daemon.plugins.media-keys custom-keybindings "$new_bindings"
+    fi
+
+    # Configure the shortcut
+    gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$path name "$name"
+    gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$path command "$command"
+    gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$path binding "$shortcut"
+
+    echo "Keyboard shortcut set: $shortcut"
+}
+
+setup_kde_shortcut() {
+    local shortcut="$1"
+    local command="$HOME/.local/bin/dictate-deepgram"
+
+    # KDE uses kwriteconfig5/6 and kglobalaccel
+    if command -v kwriteconfig6 &> /dev/null; then
+        KWRITE="kwriteconfig6"
+    elif command -v kwriteconfig5 &> /dev/null; then
+        KWRITE="kwriteconfig5"
+    else
+        echo "Warning: Could not find kwriteconfig. Set shortcut manually in System Settings."
+        return
+    fi
+
+    $KWRITE --file kglobalshortcutsrc --group "dictate-deepgram.desktop" --key "_launch" "$shortcut,none,Dictate"
+    $KWRITE --file kglobalshortcutsrc --group "dictate-deepgram.desktop" --key "_k_friendly_name" "Dictate"
+
+    # Create desktop entry for KDE
+    mkdir -p "$HOME/.local/share/applications"
+    cat > "$HOME/.local/share/applications/dictate-deepgram.desktop" << DESKTOP
+[Desktop Entry]
+Name=Dictate
+Comment=Voice dictation using Deepgram
+Exec=$command
+Icon=audio-input-microphone
+Type=Application
+Categories=Utility;
+DESKTOP
+
+    # Reload shortcuts
+    if command -v kquitapp6 &> /dev/null; then
+        kquitapp6 kglobalaccel && kglobalaccel6 &
+    elif command -v kquitapp5 &> /dev/null; then
+        kquitapp5 kglobalaccel && kglobalaccel5 &
+    fi
+
+    echo "Keyboard shortcut set: $shortcut"
+}
+
+# Detect desktop environment and set up shortcut
+echo "Setting up keyboard shortcut..."
+
+# Default shortcut
+SHORTCUT="<Super>d"
+
+if [ "$XDG_CURRENT_DESKTOP" = "GNOME" ] || [ "$XDG_SESSION_DESKTOP" = "gnome" ]; then
+    setup_gnome_shortcut "$SHORTCUT"
+elif [ "$XDG_CURRENT_DESKTOP" = "KDE" ] || [ "$XDG_SESSION_DESKTOP" = "plasma" ]; then
+    # KDE uses different format
+    setup_kde_shortcut "Meta+D"
+else
+    echo "Desktop environment not detected. Set keyboard shortcut manually:"
+    echo "  Command: $HOME/.local/bin/dictate-deepgram"
+    echo "  Suggested shortcut: Super+D"
+fi
 
 echo
 echo "=== Installation complete ==="
-echo "Run 'dictate-deepgram' to start dictating."
-echo "Run it again (or press Ctrl+C) to stop."
+echo "Press Super+D to start/stop dictation."

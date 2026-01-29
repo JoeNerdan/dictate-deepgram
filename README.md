@@ -16,7 +16,7 @@ Voice dictation for Linux using Deepgram's live transcription API. Types directl
 curl -fsSL https://raw.githubusercontent.com/JoeNerdan/dictate-deepgram/main/install.sh | bash
 ```
 
-This installs dependencies, prompts for your API key, and sets everything up.
+This installs dependencies, prompts for your API key, sets up a keyboard shortcut (**Super+D**), and you're ready to go.
 
 Get an API key at https://console.deepgram.com/
 
@@ -77,7 +77,7 @@ dictate-deepgram --lang=auto    # Auto-detect
 dictate-deepgram
 ```
 
-Bind to a keyboard shortcut for hands-free operation.
+The installer sets up **Super+D** as the keyboard shortcut (GNOME/KDE).
 
 ## How it works
 
