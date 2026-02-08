@@ -123,60 +123,52 @@ def release_lock():
 
 class DisplayState:
     """
-    Track what's currently typed on screen.
+    Track what's currently typed on screen using actual text content.
 
-    Key insight: We track two lengths:
-    - final_len: Characters that are finalized (never backspace past this)
-    - typed_len: Total characters currently on screen
-
-    The interim portion (typed_len - final_len) can be backspaced and retyped.
+    Stores the full text on screen and diffs against it on each update,
+    so interim hypothesis revisions (same length but different content,
+    shorter replacements, changed prefixes) are all handled correctly.
     """
 
     def __init__(self):
-        self.final_len = 0      # Characters that are permanent
-        self.typed_len = 0      # Total characters on screen
+        self.final_len = 0      # Characters that are permanent (never backspace past)
+        self.screen_text = ""   # Actual text currently on screen
         self.lock = threading.Lock()
 
     def update(self, new_text: str, is_final: bool):
         """
         Update the display to show new_text.
 
-        For interim results: may backspace and retype the interim portion.
-        For final results: mark as permanent and add trailing space.
+        Finds the first point of divergence (after final_len) between
+        the current screen text and the new text, backspaces to that
+        point, and retypes the new suffix.
         """
         with self.lock:
-            new_len = len(new_text)
+            old = self.screen_text
 
-            if new_len > self.typed_len:
-                # Text grew - just type the new characters
-                to_type = new_text[self.typed_len:]
-                xdotool_type(to_type)
-                self.typed_len = new_len
+            # Find first divergence point (never before final_len)
+            diverge = self.final_len
+            limit = min(len(old), len(new_text))
+            while diverge < limit and old[diverge] == new_text[diverge]:
+                diverge += 1
 
-            elif new_len < self.typed_len:
-                # Text got shorter (correction) - backspace and retype
-                # Only backspace the interim portion, never past final_len
-                interim_typed = self.typed_len - self.final_len
-                chars_to_remove = self.typed_len - new_len
-                backspace_count = min(chars_to_remove, interim_typed)
+            # Backspace from end of old text to divergence point
+            bs_count = len(old) - diverge
+            if bs_count > 0:
+                xdotool_backspace(bs_count)
 
-                if backspace_count > 0:
-                    xdotool_backspace(backspace_count)
+            # Type new text from divergence point onward
+            suffix = new_text[diverge:]
+            if suffix:
+                xdotool_type(suffix)
 
-                # After backspace, we're at position (typed_len - backspace_count)
-                cursor_pos = self.typed_len - backspace_count
-
-                # Type any new characters from cursor position to new_len
-                if new_len > cursor_pos:
-                    xdotool_type(new_text[cursor_pos:])
-
-                self.typed_len = new_len
+            self.screen_text = new_text
 
             if is_final:
-                self.final_len = new_len
-                # Add space after final phrase
+                self.final_len = len(new_text)
+                # Add space separator after finalized phrase
                 xdotool_type(" ")
-                self.typed_len += 1
+                self.screen_text += " "
                 self.final_len += 1
 
 
@@ -334,11 +326,15 @@ def run_streaming_recognition(lang: str):
         ("sample_rate", "16000"),
         ("channels", "1"),
         ("smart_format", "true"),
-        ("endpointing", "700"),  # Higher value for cleaner utterance boundaries
+        ("endpointing", "500"),       # Faster finalization, less interim churn
+        ("dictation", "true"),        # Spoken "comma"/"period" become punctuation
+        ("utterance_end_ms", "2000"), # Cleaner end-of-utterance detection
+        ("vad_events", "true"),       # Reset silence timer on voice activity
+        ("no_delay", "true"),         # Lower latency for interim results
     ]
 
     # Add keyterms - each as separate param for individual boosting
-    keyterms = ["appwrite", "claude", "claude code", "docs", "mcp", "liviano", "bikecheck"]
+    keyterms = ["appwrite", "claude", "claude code", "docs", "mcp", "liviano", "bikecheck", "tmux", "dev server"]
     for term in keyterms:
         params.append(("keyterm", term))
 
@@ -373,8 +369,14 @@ def run_streaming_recognition(lang: str):
                     except (json.JSONDecodeError, TypeError):
                         continue
 
+                    # Handle VAD and utterance events (reset silence timer)
+                    msg_type = result.get("type")
+                    if msg_type in ("SpeechStarted", "UtteranceEnd"):
+                        update_activity()
+                        continue
+
                     # Skip non-transcript messages
-                    if result.get("type") != "Results":
+                    if msg_type != "Results":
                         continue
 
                     try:
